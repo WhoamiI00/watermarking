@@ -1,0 +1,170 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Self-Recovery Reversible Image Watermarking</title>
+<link rel="stylesheet" href="/static/style.css" />
+</head>
+<body>
+
+<header class="hero">
+  <div class="hero-inner">
+    <div class="badge">PLoS ONE 2018 &middot; Zhang, Sun, Gao, Jin</div>
+    <h1>Self-Recovery Reversible Image Watermarking</h1>
+    <p class="lede">
+      A faithful implementation of the multi-scale / BCH / GDE + LSB scheme. Upload an image,
+      watermark it, launch an attack (mean, collage, JPEG, noise, rotation, &hellip;), and watch
+      the algorithm locate and repair the tampered regions.
+    </p>
+  </div>
+</header>
+
+<main>
+
+<!-- ============================================================ -->
+<!-- STEP 1 -->
+<!-- ============================================================ -->
+<section class="card" id="step-embed">
+  <div class="card-header">
+    <span class="step">Step 1</span>
+    <h2>Embed the recovery watermark</h2>
+  </div>
+
+  <div class="card-body grid-2">
+    <div>
+      <label class="file-drop" id="drop-cover">
+        <input type="file" id="file-cover" accept="image/*" hidden />
+        <div class="drop-inner">
+          <strong>Drop cover image or click to browse</strong>
+          <small>Will be normalised to 512&times;512 grayscale.</small>
+        </div>
+      </label>
+
+      <div class="controls">
+        <label>
+          <span>Key</span>
+          <input id="key" type="number" value="12345" />
+        </label>
+        <label>
+          <span>&gamma; (homogeneity)</span>
+          <input id="gamma" type="number" step="0.05" min="0.05" max="0.9" value="0.30" />
+        </label>
+        <label>
+          <span>Target size</span>
+          <select id="target-size">
+            <option value="256">256 &times; 256</option>
+            <option value="512" selected>512 &times; 512</option>
+          </select>
+        </label>
+      </div>
+
+      <button class="primary" id="btn-embed">Generate watermarked image</button>
+      <div class="status" id="status-embed"></div>
+    </div>
+
+    <div>
+      <div class="metrics" id="metrics-embed"></div>
+      <div class="preview-grid">
+        <figure><figcaption>Cover image</figcaption><div class="thumb" id="img-original"></div></figure>
+        <figure><figcaption>Multi-scale decomposition</figcaption><div class="thumb" id="img-decomp"></div></figure>
+        <figure><figcaption>Watermarked</figcaption><div class="thumb" id="img-watermarked"></div></figure>
+        <figure><figcaption>Restored (no attack)</figcaption><div class="thumb" id="img-restored"></div></figure>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ============================================================ -->
+<!-- STEP 2 -->
+<!-- ============================================================ -->
+<section class="card locked" id="step-attack">
+  <div class="card-header">
+    <span class="step">Step 2</span>
+    <h2>Attack the watermarked image and recover it</h2>
+  </div>
+
+  <div class="card-body">
+    <div class="attack-grid">
+      <button class="attack-btn" data-attack="mean" data-hot="1">Mean attack <small>Fig 16</small></button>
+      <button class="attack-btn" data-attack="collage" data-hot="1">Collage attack <small>Fig 17</small></button>
+      <button class="attack-btn" data-attack="rectangular">Rectangular paint</button>
+      <button class="attack-btn" data-attack="gaussian">Gaussian filter</button>
+      <button class="attack-btn" data-attack="median">Median filter</button>
+      <button class="attack-btn" data-attack="white_noise">White noise</button>
+      <button class="attack-btn" data-attack="salt_pepper">Salt &amp; pepper</button>
+      <button class="attack-btn" data-attack="shear">Shear 1/32</button>
+      <button class="attack-btn" data-attack="jpeg">JPEG Q=50</button>
+      <button class="attack-btn" data-attack="rescale">Rescale 70%</button>
+      <button class="attack-btn" data-attack="rotation">Rotation 30&deg;</button>
+      <button class="attack-btn" data-attack="none">No attack (sanity)</button>
+    </div>
+
+    <div id="attack-params" class="attack-params"></div>
+
+    <div class="controls">
+      <label id="donor-upload" style="display:none">
+        <span>Donor image (for collage)</span>
+        <input type="file" id="file-donor" accept="image/*" />
+      </label>
+    </div>
+
+    <button class="primary" id="btn-attack" disabled>Run attack and recover</button>
+    <div class="status" id="status-attack"></div>
+
+    <div class="metrics" id="metrics-attack"></div>
+
+    <div class="preview-grid grid-4">
+      <figure><figcaption>Watermarked</figcaption><div class="thumb" id="img-wm2"></div></figure>
+      <figure><figcaption>Attacked</figcaption><div class="thumb" id="img-attacked"></div></figure>
+      <figure><figcaption>Detected tampered regions</figcaption><div class="thumb" id="img-detected"></div></figure>
+      <figure><figcaption>Recovered</figcaption><div class="thumb" id="img-recovered"></div></figure>
+    </div>
+  </div>
+</section>
+
+<!-- ============================================================ -->
+<!-- paper reference -->
+<!-- ============================================================ -->
+<section class="card light" id="paper-refs">
+  <div class="card-header">
+    <h2>Paper reference values (Lena 512&times;512, &gamma; = 0.3)</h2>
+  </div>
+  <div class="card-body">
+    <table>
+      <thead>
+        <tr><th>Scenario</th><th>Paper</th><th>Your run</th></tr>
+      </thead>
+      <tbody id="paper-table">
+        <tr data-ref="psnr_watermarked"><td>PSNR &mdash; watermarked (no attack)</td><td>41.34 dB</td><td>&ndash;</td></tr>
+        <tr data-ref="nc"><td>NC &mdash; reversibility</td><td>1.0000</td><td>&ndash;</td></tr>
+        <tr data-ref="mean"><td>PSNR &mdash; mean attack recovered</td><td>69.81 dB</td><td>&ndash;</td></tr>
+        <tr data-ref="collage"><td>PSNR &mdash; collage attack recovered</td><td>63.82 dB</td><td>&ndash;</td></tr>
+        <tr data-ref="gaussian03"><td>PSNR &mdash; Gaussian &sigma;=0.3</td><td>37.47 dB</td><td>&ndash;</td></tr>
+        <tr data-ref="median3"><td>PSNR &mdash; Median 3&times;3</td><td>37.17 dB</td><td>&ndash;</td></tr>
+        <tr data-ref="noise001"><td>PSNR &mdash; White noise 0.01</td><td>37.76 dB</td><td>&ndash;</td></tr>
+        <tr data-ref="salt002"><td>PSNR &mdash; Salt &amp; pepper 0.02</td><td>37.04 dB</td><td>&ndash;</td></tr>
+        <tr data-ref="shear"><td>PSNR &mdash; Shear 1/32</td><td>30.17 dB</td><td>&ndash;</td></tr>
+        <tr data-ref="jpeg50"><td>PSNR &mdash; JPEG Q=50</td><td>38.21 dB</td><td>&ndash;</td></tr>
+        <tr data-ref="shrink"><td>PSNR &mdash; Shrink 30%</td><td>37.13 dB</td><td>&ndash;</td></tr>
+        <tr data-ref="rot30"><td>PSNR &mdash; Rotate 30&deg;</td><td>38.03 dB</td><td>&ndash;</td></tr>
+      </tbody>
+    </table>
+    <p class="note">The paper reports values for 512&times;512 Lena. Your results will be close for similar
+      natural images. The algorithm is probabilistic in several places (logistic chaotic map, BCH correction boundary cases),
+      so small deviations are expected.</p>
+  </div>
+</section>
+
+</main>
+
+<footer>
+  <small>
+    Built on FastAPI &middot; NumPy &middot; OpenCV &middot;
+    Algorithm from <a href="https://doi.org/10.1371/journal.pone.0199143" target="_blank" rel="noopener">doi:10.1371/journal.pone.0199143</a>
+  </small>
+</footer>
+
+<script src="/static/app.js"></script>
+</body>
+</html>
