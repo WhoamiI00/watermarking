@@ -38,7 +38,7 @@ import cv2
 import numpy as np
 
 from . import bch, chaos
-from .embedding import embed_lsb2, extract_lsb2
+from .embedding import embed_lsb1, embed_lsb2, extract_lsb1, extract_lsb2
 from .multiscale import Block, block_map, decompose
 
 
@@ -59,6 +59,13 @@ def _idx_to_slice(idx: int, size: int) -> Tuple[slice, slice]:
 def _idx_rc(idx: int, size: int) -> Tuple[int, int]:
     cols = size // 4
     return (idx // cols) * 4, (idx % cols) * 4
+
+
+def _skip_blend_for_sanity(tampered: np.ndarray) -> bool:
+    """cv2.inpaint is expensive on huge masks and pointless on tiny ones --
+    gate the fused reconstruction path to avoid both."""
+    n = int(tampered.sum())
+    return n < 8  # fewer than 8 tampered 4x4 blocks -> just paste thumbnail
 
 
 # =====================================================================
@@ -101,12 +108,28 @@ def _decode_feature_bits(bits11: np.ndarray) -> Tuple[int, int]:
 
 
 # =====================================================================
-# Sidecar  --  two independent layers of (pair -> target) mappings for
-# 2x redundancy. A source block S has its feature copied into two
-# different target blocks, chosen by two different chaotic
-# permutations. If one copy is wiped out by a collage/paint attack,
-# the other copy usually survives and the receiver can cross-check
-# them to localise tampering and repair it cleanly.
+# Sidecar
+# =====================================================================
+# Two embedding layers, each occupies a disjoint half of the image's
+# 4x4 blocks so one layer cannot overwrite another layer's payload.
+#
+#  Layer A : 1-LSB substitution (IMPROVEMENT E1).  Capacity 16 bits per
+#            target block = 1 BCH(15,11,1) codeword = 1 source per
+#            target. Using only one LSB keeps the per-pixel change at
+#            most 1 greylevel, raising the watermarked-image PSNR to
+#            ~46 dB (a ~3 dB gain over the uniform-2-LSB scheme).
+#            Because a target only holds one source, not every source
+#            gets a layer-A copy: the first M/2 entries of the chaotic
+#            source permutation are chosen.
+#
+#  Layer B : 2-LSB substitution. Capacity 32 bits per target block = 2
+#            BCH codewords = 2 sources per target. Every one of the M
+#            source blocks has a layer-B copy.
+#
+# Sources covered by both layers get the dual-copy cross-check; sources
+# covered only by layer B fall back to the layer-B copy alone plus the
+# outlier-against-neighbours sanity (which has been tightened in R3 to
+# handle the both-copies-corrupted case too).
 # =====================================================================
 @dataclass
 class Sidecar:
@@ -114,12 +137,11 @@ class Sidecar:
     gamma: float
     key: int
     blocks: List[Block]                     # multi-scale leaves (viz only)
-    # Two independent layers. For layer L in {A, B}:
-    #   pair_sources_L: [s0, s1, s2, s3, ...] consecutive pairs
-    #   target_blocks_L[k]: 4x4 target block index for pair k
-    pair_sources_a: List[int]
+    # Layer A: 1 source per target, 1-LSB embedding
+    layer_a_sources: List[int]              # length = len(target_blocks_a)
     target_blocks_a: List[int]
-    pair_sources_b: List[int]
+    # Layer B: 2 sources per target (pair), 2-LSB embedding
+    pair_sources_b: List[int]               # length = 2 * len(target_blocks_b)
     target_blocks_b: List[int]
 
     def to_json(self) -> Dict:
@@ -128,7 +150,7 @@ class Sidecar:
             "gamma": self.gamma,
             "key": self.key,
             "blocks": [{"y": b.y, "x": b.x, "size": b.size, "homogeneous": b.homogeneous} for b in self.blocks],
-            "pair_sources_a": list(map(int, self.pair_sources_a)),
+            "layer_a_sources": list(map(int, self.layer_a_sources)),
             "target_blocks_a": list(map(int, self.target_blocks_a)),
             "pair_sources_b": list(map(int, self.pair_sources_b)),
             "target_blocks_b": list(map(int, self.target_blocks_b)),
@@ -142,7 +164,7 @@ class Sidecar:
             key=int(d["key"]),
             blocks=[Block(y=b["y"], x=b["x"], size=b["size"], homogeneous=b["homogeneous"])
                     for b in d["blocks"]],
-            pair_sources_a=[int(v) for v in d["pair_sources_a"]],
+            layer_a_sources=[int(v) for v in d["layer_a_sources"]],
             target_blocks_a=[int(v) for v in d["target_blocks_a"]],
             pair_sources_b=[int(v) for v in d["pair_sources_b"]],
             target_blocks_b=[int(v) for v in d["target_blocks_b"]],
@@ -155,69 +177,73 @@ class Sidecar:
 def _allocate_two_layers(
     size: int, key: int
 ) -> Tuple[List[int], List[int], List[int], List[int]]:
-    """Build two layers of (pair -> target) mappings with disjoint target
-    sets (so one target never overwrites another layer's payload).
+    """Build the layer-A (1 source / target) and layer-B (2 sources /
+    target) mappings. The full set of 4x4 block indices is partitioned
+    into two halves via one chaotic permutation; layer A gets the
+    first half as targets, layer B gets the second half.
 
-    Returns (pair_sources_a, target_blocks_a, pair_sources_b, target_blocks_b).
+    Returns (layer_a_sources, target_blocks_a, pair_sources_b, target_blocks_b).
 
-    * The full set of 4x4 block indices is partitioned into two halves
-      via a single chaotic target permutation. Layer A uses the first
-      half; layer B uses the second half.
-    * Each layer has its own source permutation (different key), so the
-      two copies of a source's feature live in different positions.
-    * A source block is never mapped to itself as a target.
+      * layer_a_sources[k]     = source at layer-A target k (single).
+      * target_blocks_a[k]     = 4x4 target block index for layer-A entry k.
+      * pair_sources_b[2*k]    = first source at layer-B target k.
+      * pair_sources_b[2*k+1]  = second source at layer-B target k.
+      * target_blocks_b[k]     = 4x4 target block index for layer-B pair k.
     """
     M = _num_4x4(size)
     assert M % 2 == 0
+    n_half = M // 2
 
     tgt_perm = chaos.logistic_permutation(M, key)
-    layer_a_targets = [int(v) for v in tgt_perm[:M // 2].tolist()]
-    layer_b_targets = [int(v) for v in tgt_perm[M // 2:].tolist()]
+    layer_a_targets_raw = [int(v) for v in tgt_perm[:n_half].tolist()]
+    layer_b_targets_raw = [int(v) for v in tgt_perm[n_half:].tolist()]
 
+    # Layer-A sources: take the first n_half entries of an independent
+    # source permutation (so only half the sources have a layer-A copy).
     src_perm_a = chaos.logistic_permutation(M, (key * 2654435761) & 0xFFFFFFFF)
-    src_perm_b = chaos.logistic_permutation(M, (key * 40503) & 0xFFFFFFFF)
-    pair_sources_a = [int(v) for v in src_perm_a.tolist()]
-    pair_sources_b = [int(v) for v in src_perm_b.tolist()]
+    layer_a_sources_raw = [int(v) for v in src_perm_a[:n_half].tolist()]
 
-    def _assign(pair_sources, available):
+    # Layer-B sources: full permutation, consecutive pairs.
+    src_perm_b = chaos.logistic_permutation(M, (key * 40503) & 0xFFFFFFFF)
+    pair_sources_b_raw = [int(v) for v in src_perm_b.tolist()]
+
+    # Repair self-mapping for layer A (1 source, 1 target).
+    target_blocks_a = list(layer_a_targets_raw)
+    for i in range(n_half):
+        if target_blocks_a[i] == layer_a_sources_raw[i]:
+            j = (i + 1) % n_half
+            target_blocks_a[i], target_blocks_a[j] = target_blocks_a[j], target_blocks_a[i]
+    layer_a_sources = layer_a_sources_raw
+
+    # Repair self-mapping for layer B (2 sources per target).
+    def _assign_layer_b(pair_sources, available):
         n_pairs = len(available)
         available = list(available)
         target_blocks = [0] * n_pairs
-        # First pass: assign each pair its permutation-given slot, unless
-        # the slot is one of this pair's own sources (we swap later).
         defer = []
         for k in range(n_pairs):
-            sA = pair_sources[2 * k]
-            sB = pair_sources[2 * k + 1]
+            sA = pair_sources[2 * k]; sB = pair_sources[2 * k + 1]
             cand = available[k]
             if cand == sA or cand == sB:
-                defer.append(k)
-                target_blocks[k] = -1
+                defer.append(k); target_blocks[k] = -1
             else:
                 target_blocks[k] = cand
-        # Repair self-mapping pairs by pairwise swap with any valid slot.
         for k in defer:
-            sA = pair_sources[2 * k]
-            sB = pair_sources[2 * k + 1]
+            sA = pair_sources[2 * k]; sB = pair_sources[2 * k + 1]
             my_cand = available[k]
             for j in range(n_pairs):
                 if j == k or target_blocks[j] == -1:
                     continue
                 tj = target_blocks[j]
-                sjA = pair_sources[2 * j]
-                sjB = pair_sources[2 * j + 1]
+                sjA = pair_sources[2 * j]; sjB = pair_sources[2 * j + 1]
                 if tj != sA and tj != sB and my_cand != sjA and my_cand != sjB:
-                    target_blocks[k] = tj
-                    target_blocks[j] = my_cand
-                    break
+                    target_blocks[k] = tj; target_blocks[j] = my_cand; break
             if target_blocks[k] == -1:
-                # fall back: let it self-map rather than crash (extremely rare).
                 target_blocks[k] = my_cand
         return target_blocks
 
-    target_blocks_a = _assign(pair_sources_a, layer_a_targets)
-    target_blocks_b = _assign(pair_sources_b, layer_b_targets)
-    return pair_sources_a, target_blocks_a, pair_sources_b, target_blocks_b
+    target_blocks_b = _assign_layer_b(pair_sources_b_raw, layer_b_targets_raw)
+    return layer_a_sources, target_blocks_a, pair_sources_b_raw, target_blocks_b
 
 
 # =====================================================================
@@ -241,49 +267,49 @@ def embed(image: np.ndarray, key: int = 12345, gamma: float = 0.3) -> Tuple[np.n
     means = np.clip(np.round(means), 0, 255).astype(np.uint8).flatten()
     stds = stds.flatten()
 
-    # 3. Allocate TWO layers of (pair -> target) assignments with
-    # disjoint target sets (target permutation halves A and B partition
-    # the image's 4x4 blocks, so layers never overwrite each other).
-    pair_sources_a, target_blocks_a, pair_sources_b, target_blocks_b = \
+    # 3. Allocate the two layers (see IMPROVEMENTS.md E1).
+    layer_a_sources, target_blocks_a, pair_sources_b, target_blocks_b = \
         _allocate_two_layers(size, key)
 
-    # 4. Embed. Both layers use 2-LSB substitution -- 30 bits each.
+    # 4. Embed.
     watermarked = image.copy()
 
-    def _embed_layer(pair_sources, target_blocks):
-        for k in range(len(target_blocks)):
-            sA = pair_sources[2 * k]
-            sB = pair_sources[2 * k + 1]
-            tgt = target_blocks[k]
+    # ---- Layer A: 1-LSB, 1 source per target, 15-bit codeword + 1 pad
+    for k in range(len(target_blocks_a)):
+        s = layer_a_sources[k]
+        m = int(means[s])
+        c = int(np.searchsorted(_STD_BINS, stds[s], side="right") - 1)
+        c = max(0, min(7, c))
+        msg = _encode_feature_bits(m, c)
+        cw = bch.encode_block(msg)            # 15 bits
+        payload = np.zeros(16, dtype=np.uint8)
+        payload[:15] = cw
+        tgt_slice = _idx_to_slice(target_blocks_a[k], size)
+        watermarked[tgt_slice] = embed_lsb1(watermarked[tgt_slice], payload)
 
-            mA = int(means[sA])
-            mB = int(means[sB])
-            cA = int(np.searchsorted(_STD_BINS, stds[sA], side="right") - 1)
-            cB = int(np.searchsorted(_STD_BINS, stds[sB], side="right") - 1)
-            cA = max(0, min(7, cA))
-            cB = max(0, min(7, cB))
-
-            msgA = _encode_feature_bits(mA, cA)
-            msgB = _encode_feature_bits(mB, cB)
-            cwA = bch.encode_block(msgA)
-            cwB = bch.encode_block(msgB)
-
-            payload = np.zeros(32, dtype=np.uint8)
-            payload[:15] = cwA
-            payload[15:30] = cwB
-
-            tgt_slice = _idx_to_slice(tgt, size)
-            watermarked[tgt_slice] = embed_lsb2(watermarked[tgt_slice], payload)
-
-    _embed_layer(pair_sources_a, target_blocks_a)
-    _embed_layer(pair_sources_b, target_blocks_b)
+    # ---- Layer B: 2-LSB, 2 sources per target, two 15-bit codewords
+    for k in range(len(target_blocks_b)):
+        sA = pair_sources_b[2 * k]
+        sB = pair_sources_b[2 * k + 1]
+        mA = int(means[sA]); mB = int(means[sB])
+        cA = int(np.searchsorted(_STD_BINS, stds[sA], side="right") - 1)
+        cB = int(np.searchsorted(_STD_BINS, stds[sB], side="right") - 1)
+        cA = max(0, min(7, cA)); cB = max(0, min(7, cB))
+        msgA = _encode_feature_bits(mA, cA)
+        msgB = _encode_feature_bits(mB, cB)
+        cwA = bch.encode_block(msgA); cwB = bch.encode_block(msgB)
+        payload = np.zeros(32, dtype=np.uint8)
+        payload[:15] = cwA
+        payload[15:30] = cwB
+        tgt_slice = _idx_to_slice(target_blocks_b[k], size)
+        watermarked[tgt_slice] = embed_lsb2(watermarked[tgt_slice], payload)
 
     sidecar = Sidecar(
         size=size,
         gamma=gamma,
         key=key,
         blocks=leaf,
-        pair_sources_a=pair_sources_a,
+        layer_a_sources=layer_a_sources,
         target_blocks_a=target_blocks_a,
         pair_sources_b=pair_sources_b,
         target_blocks_b=target_blocks_b,
@@ -317,12 +343,36 @@ class RecoveryResult:
     global_attack_detected: bool = False
 
 
-def _extract_layer(
+def _extract_layer_a(
+    suspect: np.ndarray, size: int, layer_a_sources, target_blocks
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Extract layer-A features (1-LSB, 1 source per target).
+
+    Returns (mean_a, std_a, has_copy_a) where ``has_copy_a[i]`` is True
+    for sources that have a layer-A copy (only half the sources do).
+    """
+    M = _num_4x4(size)
+    mean_a = np.zeros(M, dtype=np.uint8)
+    std_a = np.zeros(M, dtype=np.uint8)
+    has_copy_a = np.zeros(M, dtype=bool)
+    for k, s in enumerate(layer_a_sources):
+        tgt = target_blocks[k]
+        bits = extract_lsb1(suspect[_idx_to_slice(tgt, size)], n_bits=15)
+        msg = bch.decode_block(bits)
+        m, c = _decode_feature_bits(msg)
+        mean_a[s] = m
+        std_a[s] = c
+        has_copy_a[s] = True
+    return mean_a, std_a, has_copy_a
+
+
+def _extract_layer_b(
     suspect: np.ndarray, size: int, pair_sources, target_blocks
 ) -> Tuple[np.ndarray, np.ndarray]:
+    """Extract layer-B features (2-LSB, 2 sources per target)."""
     M = _num_4x4(size)
-    recovered_mean = np.zeros(M, dtype=np.uint8)
-    recovered_std = np.zeros(M, dtype=np.uint8)
+    mean_b = np.zeros(M, dtype=np.uint8)
+    std_b = np.zeros(M, dtype=np.uint8)
     for k in range(len(target_blocks)):
         sA = pair_sources[2 * k]
         sB = pair_sources[2 * k + 1]
@@ -332,11 +382,9 @@ def _extract_layer(
         msgB = bch.decode_block(bits[15:30])
         mA, cA = _decode_feature_bits(msgA)
         mB, cB = _decode_feature_bits(msgB)
-        recovered_mean[sA] = mA
-        recovered_std[sA] = cA
-        recovered_mean[sB] = mB
-        recovered_std[sB] = cB
-    return recovered_mean, recovered_std
+        mean_b[sA] = mA; std_b[sA] = cA
+        mean_b[sB] = mB; std_b[sB] = cB
+    return mean_b, std_b
 
 
 def _extract_recovery_features(
@@ -344,42 +392,49 @@ def _extract_recovery_features(
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Returns (recovered_mean, recovered_std, copies_agree).
 
-    For each source block, extract the feature from both target copies
-    (layer A and layer B). If the two decoded means agree within 6
-    grayscales, trust the feature and return their average. If they
-    disagree, one copy's target was probably tampered; we flag that
-    source as having no-trust and let the caller fall back to a
-    neighbourhood estimate.
+    Sources with both a layer-A and a layer-B copy are cross-checked;
+    sources with only a layer-B copy use it directly. ``copies_agree``
+    is True wherever we have high confidence in the recovered value
+    (either both copies agreed, or only layer-B exists and looks sane).
     """
     size = sidecar.size
     M = _num_4x4(size)
 
-    mean_a, std_a = _extract_layer(
-        suspect, size, sidecar.pair_sources_a, sidecar.target_blocks_a
+    mean_a, std_a, has_copy_a = _extract_layer_a(
+        suspect, size, sidecar.layer_a_sources, sidecar.target_blocks_a
     )
-    mean_b, std_b = _extract_layer(
+    mean_b, std_b = _extract_layer_b(
         suspect, size, sidecar.pair_sources_b, sidecar.target_blocks_b
     )
-
-    # Agreement -> both copies intact. Disagreement -> at least one
-    # target was tampered; in that case pick whichever copy is closer
-    # to the 3x3 median of its neighbours (the "consensus" copy).
-    disagreement = np.abs(mean_a.astype(np.int32) - mean_b.astype(np.int32))
-    copies_agree = disagreement <= 6
 
     bw = bh = size // 4
     med_a = cv2.medianBlur(mean_a.reshape(bh, bw), 3).flatten()
     med_b = cv2.medianBlur(mean_b.reshape(bh, bw), 3).flatten()
-    a_consistent = np.abs(mean_a.astype(np.int32) - med_a.astype(np.int32)) <= \
-                   np.abs(mean_b.astype(np.int32) - med_b.astype(np.int32))
 
+    # Agreement voting: for sources covered by both layers, require the
+    # two decoded means to agree within 6 greylevels.
+    disagreement = np.abs(mean_a.astype(np.int32) - mean_b.astype(np.int32))
+    copies_agree_both = has_copy_a & (disagreement <= 6)
+    # If we have no layer-A copy, trust layer B by default (marked as
+    # agreeing, since there is nothing to disagree with).
+    copies_agree = copies_agree_both | (~has_copy_a)
+
+    # Pick the better copy per source:
+    #   - if only layer B exists -> use mean_b
+    #   - if both exist and agree -> use mean_a (== mean_b within 6)
+    #   - if both exist and disagree -> pick the one closer to its own
+    #     3x3 neighbourhood median (consensus copy)
+    a_consistent = has_copy_a & (
+        np.abs(mean_a.astype(np.int32) - med_a.astype(np.int32))
+        <= np.abs(mean_b.astype(np.int32) - med_b.astype(np.int32))
+    )
     recovered_mean = np.where(
-        copies_agree, mean_a,
-        np.where(a_consistent, mean_a, mean_b)
+        ~has_copy_a, mean_b,
+        np.where(copies_agree_both | a_consistent, mean_a, mean_b),
     ).astype(np.uint8)
     recovered_std = np.where(
-        copies_agree, std_a,
-        np.where(a_consistent, std_a, std_b)
+        ~has_copy_a, std_b,
+        np.where(copies_agree_both | a_consistent, std_a, std_b),
     ).astype(np.uint8)
 
     return recovered_mean, recovered_std, copies_agree
@@ -415,16 +470,11 @@ def detect_and_recover(
     outlier = np.abs(recovered_mean.astype(np.int32) - rec_mean_med) > 30
 
     # --- Tamper decision: flag whenever current feature disagrees with
-    # recovered feature. Dual copies + agreement voting have already
-    # produced the best available recovered value; we only care whether
-    # the current-in-suspect block matches it.
+    # recovered feature, EXCEPT when the recovered value is itself an
+    # outlier (untrustworthy).
     mean_diff = np.abs(cur_means.astype(np.int32) - recovered_mean.astype(np.int32))
     std_diff = np.abs(cur_std_code.astype(np.int32) - recovered_std.astype(np.int32))
-    # Sources where the recovered value is BOTH an outlier and the two
-    # copies disagreed are treated as "no reliable recovery" -- they
-    # can't be used to flag tampering. Everywhere else, mismatch flags.
-    unreliable = outlier & ~copies_agree
-    tampered = (~unreliable) & ((mean_diff > mean_tol) | (std_diff > std_code_tol))
+    tampered = (~outlier) & ((mean_diff > mean_tol) | (std_diff > std_code_tol))
 
     # --- Spatial regularisation by connected-component size filtering.
     # Step 1: dilate with a generous kernel so sparse flags inside one
@@ -458,21 +508,19 @@ def detect_and_recover(
         rec_mean_med.reshape(bh, bw),
     ).astype(np.uint8)
 
-    # --- Bicubic upsample the thumbnail to full resolution. This gives
-    # a smooth gradient fill that tracks the actual per-pixel variation
-    # much better than a single-mean flat fill -- closes most of the
-    # PSNR gap against the paper's recovered-image numbers.
+    # --- Bicubic upsample the cleaned thumbnail to full resolution.
     upscaled = cv2.resize(
         clean_thumbnail, (size, size), interpolation=cv2.INTER_CUBIC
     ).astype(np.uint8)
 
-    # --- Repair: paste the upscaled-thumbnail region into tampered blocks.
+    # --- Build the tamper mask at pixel resolution and fill the core.
     out = suspect.copy().astype(np.uint8)
     detected_mask = np.zeros_like(suspect)
     for i in np.where(tampered)[0]:
         r, c = _idx_rc(int(i), size)
-        out[r:r + 4, c:c + 4] = upscaled[r:r + 4, c:c + 4]
         detected_mask[r:r + 4, c:c + 4] = 255
+        out[r:r + 4, c:c + 4] = upscaled[r:r + 4, c:c + 4]
+
 
     flagged_patches = int(tampered.sum())
     tamper_fraction = flagged_patches / max(M, 1)

@@ -51,6 +51,34 @@ def extract_lsb2(block: np.ndarray, n_bits: int = 32) -> np.ndarray:
     return bits[:n_bits]
 
 
+# -------- 1-LSB substitution (cleaner, half the capacity) --------------
+def embed_lsb1(block: np.ndarray, bits: np.ndarray) -> np.ndarray:
+    """Embed up to 16 bits in the LSB of a 4x4 block (row-major order).
+
+    Uses only the least-significant bit of each pixel, so the per-pixel
+    change is at most 1 graylevel -- noticeably cleaner than 2-LSB
+    substitution. Used for the low-noise layer of the dual-copy
+    recovery scheme (see IMPROVEMENTS.md, E1).
+    """
+    assert block.shape == (4, 4)
+    flat = block.flatten().astype(np.int32)
+    payload = np.zeros(16, dtype=np.uint8)
+    payload[: bits.size] = bits
+    for i in range(16):
+        flat[i] = (flat[i] & 0xFE) | int(payload[i])
+    return flat.reshape(4, 4).astype(np.uint8)
+
+
+def extract_lsb1(block: np.ndarray, n_bits: int = 16) -> np.ndarray:
+    """Extract the first n_bits of 1-LSB data from a 4x4 block."""
+    assert block.shape == (4, 4)
+    flat = block.flatten().astype(np.int32)
+    bits = np.zeros(16, dtype=np.uint8)
+    for i in range(16):
+        bits[i] = int(flat[i]) & 0x1
+    return bits[:n_bits]
+
+
 # -------- Generalised Difference Expansion (2 bits per pair) -----------
 _PAIRS = [
     ((0, 0), (0, 1)), ((0, 2), (0, 3)),
